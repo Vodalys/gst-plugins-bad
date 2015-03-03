@@ -227,7 +227,8 @@ gst_video_aggregator_pad_prepare_frame (GstVideoAggregatorPad * pad,
   GstVideoFrame *converted_frame;
   GstBuffer *converted_buf = NULL;
   GstVideoFrame *frame;
-  static GstAllocationParams params = { 0, 15, 0, 0, };
+  GstAllocator *allocator;
+  GstAllocationParams params;
 
   if (!pad->buffer)
     return TRUE;
@@ -249,7 +250,8 @@ gst_video_aggregator_pad_prepare_frame (GstVideoAggregatorPad * pad,
     converted_size = pad->priv->conversion_info.size;
     outsize = GST_VIDEO_INFO_SIZE (&vagg->info);
     converted_size = converted_size > outsize ? converted_size : outsize;
-    converted_buf = gst_buffer_new_allocate (NULL, converted_size, &params);
+    gst_aggregator_get_allocator(GST_AGGREGATOR (vagg), &allocator, &params);
+    converted_buf = gst_buffer_new_allocate (allocator, converted_size, &params);
 
     if (!gst_video_frame_map (converted_frame, &(pad->priv->conversion_info),
             converted_buf, GST_MAP_READWRITE)) {
@@ -1788,10 +1790,12 @@ gst_videoaggregator_get_output_buffer (GstVideoAggregator * videoaggregator,
     GstBuffer ** outbuf)
 {
   guint outsize;
-  static GstAllocationParams params = { 0, 15, 0, 0, };
+  GstAllocator *allocator;
+  GstAllocationParams params;
 
   outsize = GST_VIDEO_INFO_SIZE (&videoaggregator->info);
-  *outbuf = gst_buffer_new_allocate (NULL, outsize, &params);
+  gst_aggregator_get_allocator(GST_AGGREGATOR (videoaggregator), &allocator, &params);
+  *outbuf = gst_buffer_new_allocate (allocator, outsize, &params);
 
   if (*outbuf == NULL) {
     GST_ERROR_OBJECT (videoaggregator,

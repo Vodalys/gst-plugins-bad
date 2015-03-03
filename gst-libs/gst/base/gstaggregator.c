@@ -250,6 +250,13 @@ struct _GstAggregatorPrivate
 
   /* properties */
   gint64 latency;
+  
+  
+  GstBufferPool *pool;
+  gboolean pool_active;
+  GstAllocator *allocator;
+  GstAllocationParams params;
+  GstQuery *query;
 };
 
 typedef struct
@@ -404,6 +411,233 @@ gst_aggregator_reset_flow_values (GstAggregator * self)
   GST_OBJECT_UNLOCK (self);
 }
 
+/* takes ownership of the pool, allocator and query */
+static gboolean
+gst_aggregator_set_allocation (GstAggregator * self,
+    GstBufferPool * pool, GstAllocator * allocator,
+    GstAllocationParams * params, GstQuery * query)
+{
+  GstAllocator *oldalloc;
+  GstBufferPool *oldpool;
+  GstQuery *oldquery;
+  GstAggregatorPrivate *priv = self->priv;
+
+  GST_OBJECT_LOCK (self);
+  oldpool = priv->pool;
+  priv->pool = pool;
+  priv->pool_active = FALSE;
+
+  oldalloc = priv->allocator;
+  priv->allocator = allocator;
+
+  oldquery = priv->query;
+  priv->query = query;
+
+  if (params)
+    priv->params = *params;
+  else
+    gst_allocation_params_init (&priv->params);
+  GST_OBJECT_UNLOCK (self);
+
+  if (oldpool) {
+    GST_DEBUG_OBJECT (self, "deactivating old pool %p", oldpool);
+    gst_buffer_pool_set_active (oldpool, FALSE);
+    gst_object_unref (oldpool);
+  }
+  if (oldalloc) {
+    gst_object_unref (oldalloc);
+  }
+  if (oldquery) {
+    gst_query_unref (oldquery);
+  }
+  return TRUE;
+}
+
+static gboolean
+gst_aggregator_default_decide_allocation (GstAggregator * self,
+    GstQuery * query)
+{
+  guint i, n_metas;
+  GstCaps *outcaps;
+  GstBufferPool *pool;
+  guint size, min, max;
+  GstAllocator *allocator;
+  GstAllocationParams params;
+  GstStructure *config;
+  gboolean update_allocator;
+
+  n_metas = gst_query_get_n_allocation_metas (query);
+  for (i = 0; i < n_metas; i++) {
+    GType api;
+    const GstStructure *params;
+    gboolean remove;
+
+    api = gst_query_parse_nth_allocation_meta (query, i, &params);
+
+    /* by default we remove all metadata, subclasses should implement a
+     * filter_meta function */
+    if (gst_meta_api_type_has_tag (api, _gst_meta_tag_memory)) {
+      /* remove all memory dependent metadata because we are going to have to
+       * allocate different memory for input and output. */
+      GST_LOG_OBJECT (self, "removing memory specific metadata %s",
+          g_type_name (api));
+      remove = TRUE;
+    } else {
+      GST_LOG_OBJECT (self, "removing metadata %s", g_type_name (api));
+      remove = TRUE;
+    }
+
+    if (remove) {
+      gst_query_remove_nth_allocation_meta (query, i);
+      i--;
+      n_metas--;
+    }
+  }
+
+  gst_query_parse_allocation (query, &outcaps, NULL);
+
+  /* we got configuration from our peer or the decide_allocation method,
+   * parse them */
+  if (gst_query_get_n_allocation_params (query) > 0) {
+    /* try the allocator */
+    gst_query_parse_nth_allocation_param (query, 0, &allocator, &params);
+    update_allocator = TRUE;
+  } else {
+    allocator = NULL;
+    gst_allocation_params_init (&params);
+    update_allocator = FALSE;
+  }
+
+  if (gst_query_get_n_allocation_pools (query) > 0) {
+    gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
+
+    if (pool == NULL) {
+      /* no pool, we can make our own */
+      GST_DEBUG_OBJECT (self, "no pool, making new pool");
+      pool = gst_buffer_pool_new ();
+    }
+  } else {
+    pool = NULL;
+    size = min = max = 0;
+  }
+
+  /* now configure */
+  if (pool) {
+    config = gst_buffer_pool_get_config (pool);
+    gst_buffer_pool_config_set_params (config, outcaps, size, min, max);
+    gst_buffer_pool_config_set_allocator (config, allocator, &params);
+
+    /* buffer pool may have to do some changes */
+    if (!gst_buffer_pool_set_config (pool, config)) {
+      config = gst_buffer_pool_get_config (pool);
+
+      /* If change are not acceptable, fallback to generic pool */
+      if (!gst_buffer_pool_config_validate_params (config, outcaps, size, min,
+              max)) {
+        GST_DEBUG_OBJECT (self, "unsupported pool, making new pool");
+
+        gst_object_unref (pool);
+        pool = gst_buffer_pool_new ();
+        gst_buffer_pool_config_set_params (config, outcaps, size, min, max);
+        gst_buffer_pool_config_set_allocator (config, allocator, &params);
+      }
+
+      if (!gst_buffer_pool_set_config (pool, config))
+        goto config_failed;
+    }
+  }
+
+  if (update_allocator)
+    gst_query_set_nth_allocation_param (query, 0, allocator, &params);
+  else
+    gst_query_add_allocation_param (query, allocator, &params);
+  if (allocator)
+    gst_object_unref (allocator);
+
+  if (pool) {
+    gst_query_set_nth_allocation_pool (query, 0, pool, size, min, max);
+    gst_object_unref (pool);
+  }
+
+  return TRUE;
+
+config_failed:
+  GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS,
+      ("Failed to configure the buffer pool"),
+      ("Configuration is most likely invalid, please report this issue."));
+  return FALSE;
+}
+
+static gboolean
+gst_aggregator_do_bufferpool (GstAggregator * self, GstCaps * outcaps)
+{
+  GstQuery *query;
+  gboolean result = TRUE;
+  GstBufferPool *pool = NULL;
+  GstAllocator *allocator;
+  GstAllocationParams params;
+
+  /* find a pool for the negotiated caps now */
+  GST_DEBUG_OBJECT (self, "doing allocation query");
+  query = gst_query_new_allocation (outcaps, TRUE);
+  if (!gst_pad_peer_query (self->srcpad, query)) {
+    /* not a problem, just debug a little */
+    GST_DEBUG_OBJECT (self, "peer ALLOCATION query failed");
+  }
+
+  GST_DEBUG_OBJECT (self, "calling decide_allocation");
+//  g_assert (klass->decide_allocation != NULL);
+  result = gst_aggregator_default_decide_allocation (self, query);
+
+  GST_DEBUG_OBJECT (self, "ALLOCATION (%d) params: %" GST_PTR_FORMAT, result,
+      query);
+
+  if (!result)
+    goto no_decide_allocation;
+
+  /* we got configuration from our peer or the decide_allocation method,
+   * parse them */
+  if (gst_query_get_n_allocation_params (query) > 0) {
+    gst_query_parse_nth_allocation_param (query, 0, &allocator, &params);
+  } else {
+    allocator = NULL;
+    gst_allocation_params_init (&params);
+  }
+
+  if (gst_query_get_n_allocation_pools (query) > 0)
+    gst_query_parse_nth_allocation_pool (query, 0, &pool, NULL, NULL, NULL);
+
+  /* now store */
+  result =
+      gst_aggregator_set_allocation (self, pool, allocator, &params,
+      query);
+
+  return result;
+
+  /* Errors */
+no_decide_allocation:
+  {
+    GST_WARNING_OBJECT (self, "Subclass failed to decide allocation");
+    gst_query_unref (query);
+
+    return result;
+  }
+}
+
+void
+gst_aggregator_get_allocator (GstAggregator * self,
+    GstAllocator ** allocator, GstAllocationParams * params)
+{
+  g_return_if_fail (GST_IS_AGGREGATOR (self));
+
+  if (allocator)
+    *allocator = self->priv->allocator ?
+        gst_object_ref (self->priv->allocator) : NULL;
+
+  if (params)
+    *params = self->priv->params;
+}
+
 static inline void
 gst_aggregator_push_mandatory_events (GstAggregator * self)
 {
@@ -430,6 +664,9 @@ gst_aggregator_push_mandatory_events (GstAggregator * self)
     if (!gst_pad_push_event (self->srcpad,
             gst_event_new_caps (self->priv->srccaps))) {
       GST_WARNING_OBJECT (self->srcpad, "Sending caps event failed");
+    }
+    if (!gst_aggregator_do_bufferpool (self, self->priv->srccaps)) {
+      GST_WARNING_OBJECT (self->srcpad, "Allocating buffers failed");
     }
     gst_caps_unref (self->priv->srccaps);
     self->priv->srccaps = NULL;

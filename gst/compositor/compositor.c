@@ -300,12 +300,13 @@ static gboolean
 gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     GstVideoAggregator * vagg)
 {
+  GstAllocator *allocator;
+  GstAllocationParams params;
   GstCompositorPad *cpad = GST_COMPOSITOR_PAD (pad);
   guint outsize;
   GstVideoFrame *converted_frame;
   GstBuffer *converted_buf = NULL;
   GstVideoFrame *frame;
-  static GstAllocationParams params = { 0, 15, 0, 0, };
   gint width, height;
 
   if (!pad->buffer)
@@ -408,7 +409,8 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     converted_size = cpad->conversion_info.size;
     outsize = GST_VIDEO_INFO_SIZE (&vagg->info);
     converted_size = converted_size > outsize ? converted_size : outsize;
-    converted_buf = gst_buffer_new_allocate (NULL, converted_size, &params);
+    gst_aggregator_get_allocator(GST_AGGREGATOR (vagg), &allocator, &params);
+    converted_buf = gst_buffer_new_allocate (allocator, converted_size, &params);
 
     if (!gst_video_frame_map (converted_frame, &(cpad->conversion_info),
             converted_buf, GST_MAP_READWRITE)) {
