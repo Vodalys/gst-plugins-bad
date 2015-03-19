@@ -775,6 +775,37 @@ config_failed:
   return FALSE;
 }
 
+/**
+ * Check if the current pool into vagg is compatible with the caps
+ */
+static gboolean
+gst_videoaggregator_check_src_pool (GstVideoAggregator * vagg,
+    GstCaps * caps)
+{
+  GstStructure *poolconfig;
+  GstCaps *currentPoolCaps;
+  gboolean result = TRUE;
+  guint size, min, max;
+
+  if (!vagg->priv->pool)
+    return FALSE;
+
+  poolconfig = gst_buffer_pool_get_config (vagg->priv->pool);
+
+  gst_buffer_pool_config_get_params (poolconfig, &currentPoolCaps, &size, &min,
+      &max);
+
+  GST_DEBUG_OBJECT (vagg, "Current pool configuration is %" GST_PTR_FORMAT,
+      poolconfig);
+
+  result = gst_caps_is_always_compatible (caps, currentPoolCaps);
+
+  if (poolconfig)
+    gst_structure_free (poolconfig);
+
+  return result;
+}
+
 /*
  * Function that decide
  */
@@ -799,12 +830,14 @@ gst_videoaggregator_do_bufferpool (GstVideoAggregator * vagg,
     return TRUE;
   }
 
-  /* FIXME Check if the news caps are compatible with the
+  /* Check if the news caps are compatible with the
    * previous pool configuration
    */
   if (vagg->priv->pool) {
-    GST_DEBUG_OBJECT(vagg, "Pool already configured...");
-    return TRUE;
+    result = gst_videoaggregator_check_src_pool (vagg, caps);
+    GST_WARNING_OBJECT (vagg, "Pool already configured %s...",
+        result ? "ok" : "wrong format");
+    return result;
   }
 
   /* We need to get a bufferpool from downstream and configure it.  */
