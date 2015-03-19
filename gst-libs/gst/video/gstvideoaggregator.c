@@ -45,9 +45,12 @@
 
 GST_DEBUG_CATEGORY_STATIC (gst_videoaggregator_debug);
 #define GST_CAT_DEFAULT gst_videoaggregator_debug
+#define GST_SRC_MIN_BUFFERS 16
 
 /* Needed prototypes */
 static void gst_videoaggregator_reset_qos (GstVideoAggregator * vagg);
+static gboolean gst_videoaggregator_decide_allocation (GstVideoAggregator
+    * vagg, GstQuery * query);
 
 /****************************************
  * GstVideoAggregatorPad implementation *
@@ -376,6 +379,33 @@ gst_videoaggregator_child_proxy_init (gpointer g_iface, gpointer iface_data)
  * GstVideoAggregator implementation  *
  **************************************/
 
+#define GST_TYPE_VIDEOAGGREGATOR_CAPTUREIOMODE (gst_videoaggregator_captureiomode_get_type())
+static GType
+gst_videoaggregator_captureiomode_get_type (void)
+{
+  static GType videoaggregator_captureiomode_type = 0;
+
+  static const GEnumValue videoaggregator_captureiomode[] = {
+    {VIDEOAGGREGATOR_CAPTUREIOMODE_IMPORT, "Import", "import"},
+    {VIDEOAGGREGATOR_CAPTUREIOMODE_OWN, "Own", "own"},
+    {0, NULL, NULL},
+  };
+
+  if (!videoaggregator_captureiomode_type) {
+    videoaggregator_captureiomode_type =
+        g_enum_register_static ("GstVideoaggregatorCaptureiomode",
+            videoaggregator_captureiomode);
+  }
+  return videoaggregator_captureiomode_type;
+}
+
+#define DEFAULT_OWN VIDEOAGGREGATOR_CAPTUREIOMODE_OWN
+enum
+{
+  PROP_0,
+  PROP_CAPTURE_IO_MODE,
+};
+
 #define GST_VIDEO_AGGREGATOR_GET_LOCK(vagg) (&GST_VIDEO_AGGREGATOR(vagg)->priv->lock)
 
 #define GST_VIDEO_AGGREGATOR_LOCK(vagg)   G_STMT_START {       \
@@ -411,6 +441,13 @@ struct _GstVideoAggregatorPrivate
 
   /* current caps */
   GstCaps *current_caps;
+
+  /* Allocation buffers fields */
+  GstBufferPool *pool;
+  gboolean pool_active;
+  GstAllocator *allocator;
+  GstAllocationParams params;
+  GstQuery *query;
 };
 
 G_DEFINE_ABSTRACT_TYPE_WITH_CODE (GstVideoAggregator, gst_videoaggregator,
@@ -568,6 +605,287 @@ gst_videoaggregator_update_converters (GstVideoAggregator * vagg)
   return TRUE;
 }
 
+/* takes ownership of the pool, allocator and query */
+static gboolean
+gst_videoaggregator_set_allocation (GstVideoAggregator * vagg,
+    GstBufferPool * pool, GstAllocator * allocator,
+    GstAllocationParams * params, GstQuery * query)
+{
+  GstAllocator *oldalloc;
+  GstBufferPool *oldpool;
+  GstQuery *oldquery;
+  GstVideoAggregatorPrivate *priv = vagg->priv;
+
+  GST_OBJECT_LOCK (vagg);
+  oldpool = priv->pool;
+  priv->pool = pool;
+  priv->pool_active = FALSE;
+
+  oldalloc = priv->allocator;
+  priv->allocator = allocator;
+
+  oldquery = priv->query;
+  priv->query = query;
+
+  if (params)
+    priv->params = *params;
+  else
+    gst_allocation_params_init (&priv->params);
+  GST_OBJECT_UNLOCK (vagg);
+
+  if (oldpool) {
+    GST_DEBUG_OBJECT (vagg, "deactivating old pool %p", oldpool);
+    gst_buffer_pool_set_active (oldpool, FALSE);
+    gst_object_unref (oldpool);
+  }
+  if (oldalloc) {
+    gst_object_unref (oldalloc);
+  }
+  if (oldquery) {
+    gst_query_unref (oldquery);
+  }
+  return TRUE;
+}
+
+/*
+ * Default implementation for decide_allocation function. Taking from
+ * baseTransform
+ */
+static gboolean
+gst_videoaggregator_decide_allocation (GstVideoAggregator * vagg,
+    GstQuery * query)
+{
+  guint n_metas, i, n_params;
+  GstCaps *outcaps;
+  GstBufferPool *pool;
+  guint size, min, max;
+  GstAllocator *allocator;
+  GstAllocationParams params;
+  GstStructure *config;
+  gboolean update_allocator;
+  gboolean need_pool;
+
+  n_metas = gst_query_get_n_allocation_metas (query);
+  for (i = 0; i < n_metas; i++) {
+    GType api;
+    const GstStructure *params;
+    gboolean remove = TRUE;
+
+    api = gst_query_parse_nth_allocation_meta (query, i, &params);
+
+    /* by default we remove all metadata, subclasses should implement a
+     * filter_meta function */
+    if (gst_meta_api_type_has_tag (api, _gst_meta_tag_memory)) {
+      /* remove all memory dependent metadata because we are going to have to
+       * allocate different memory for input and output. */
+      GST_DEBUG_OBJECT (vagg, "removing memory specific metadata %s",
+          g_type_name (api));
+    }
+
+    if (remove) {
+      gst_query_remove_nth_allocation_meta (query, i);
+      i--;
+      n_metas--;
+    }
+  }
+
+  n_params = gst_query_get_n_allocation_params (query);
+  /* we got configuration from our peer or the decide_allocation method,
+   * parse them */
+  if (n_params > 0) {
+    /* try the allocator */
+    gst_query_parse_nth_allocation_param (query, 0, &allocator, &params);
+    update_allocator = TRUE;
+  } else {
+    allocator = NULL;
+    gst_allocation_params_init (&params);
+    update_allocator = FALSE;
+  }
+
+  if (gst_query_get_n_allocation_pools (query) > 0) {
+    gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
+
+    if (pool == NULL) {
+      /* no pool, we can make our own */
+      GST_DEBUG_OBJECT (vagg, "no pool, making new pool");
+      pool = gst_buffer_pool_new ();
+    }
+  } else {
+    pool = NULL;
+    size = min = max = 0;
+  }
+
+  /* FIXME: */
+  if (min < GST_SRC_MIN_BUFFERS &&
+      GST_SRC_MIN_BUFFERS < max)
+    min = GST_SRC_MIN_BUFFERS;
+
+  gst_query_parse_allocation (query, &outcaps, &need_pool);
+
+  /* now configure */
+  if (pool) {
+    config = gst_buffer_pool_get_config (pool);
+    gst_buffer_pool_config_set_params (config, outcaps, size, min, max);
+    gst_buffer_pool_config_set_allocator (config, allocator, &params);
+
+    /* buffer pool may have to do some changes */
+    if (!gst_buffer_pool_set_config (pool, config)) {
+      GST_DEBUG_OBJECT (vagg, "Fail setting config to bufferpool");
+      config = gst_buffer_pool_get_config (pool);
+
+      /* If change are not acceptable, fallback to generic pool */
+      if (!gst_buffer_pool_config_validate_params (config, outcaps, size, min,
+              max)) {
+        GST_DEBUG_OBJECT (vagg, "unsuported pool, making new pool");
+
+        gst_object_unref (pool);
+        pool = gst_buffer_pool_new ();
+        gst_buffer_pool_config_set_params (config, outcaps, size, min, max);
+        gst_buffer_pool_config_set_allocator (config, allocator, &params);
+      }
+
+      if (!gst_buffer_pool_set_config (pool, config))
+        goto config_failed;
+
+      GST_DEBUG_OBJECT (vagg, "Pool configured!!");
+    }
+  }
+
+  if (update_allocator) {
+    GST_DEBUG_OBJECT (vagg, "Updating allocator");
+    gst_query_set_nth_allocation_param (query, 0, allocator, &params);
+  } else {
+    GST_DEBUG_OBJECT (vagg, "Adding allocator params");
+    gst_query_add_allocation_param (query, allocator, &params);
+  }
+  if (allocator)
+    gst_object_unref (allocator);
+
+  if (pool) {
+    gst_query_set_nth_allocation_pool (query, 0, pool, size, min, max);
+    gst_object_unref (pool);
+  }
+
+  return TRUE;
+
+config_failed:
+  GST_ELEMENT_ERROR (vagg, RESOURCE, SETTINGS,
+      ("Failed to configure the buffer pool"),
+      ("Configuration is most likely invalid, please report this issue."));
+  return FALSE;
+}
+
+/**
+ * Check if the current pool into vagg is compatible with the caps
+ */
+static gboolean
+gst_videoaggregator_check_src_pool (GstVideoAggregator * vagg,
+    GstCaps * caps)
+{
+  GstStructure *poolconfig;
+  GstCaps *currentPoolCaps;
+  gboolean result = TRUE;
+  guint size, min, max;
+
+  if (!vagg->priv->pool)
+    return FALSE;
+
+  poolconfig = gst_buffer_pool_get_config (vagg->priv->pool);
+
+  gst_buffer_pool_config_get_params (poolconfig, &currentPoolCaps, &size, &min,
+      &max);
+
+  GST_DEBUG_OBJECT (vagg, "Current pool configuration is %" GST_PTR_FORMAT,
+      poolconfig);
+
+  result = gst_caps_is_always_compatible (caps, currentPoolCaps);
+
+  if (poolconfig)
+    gst_structure_free (poolconfig);
+
+  return result;
+}
+
+/*
+ * Function that decide
+ */
+static gboolean
+gst_videoaggregator_do_bufferpool (GstVideoAggregator * vagg,
+    GstCaps * caps)
+{
+  GstQuery *query;
+  gboolean result = TRUE;
+  GstBufferPool *pool = NULL;
+  GstVideoAggregatorClass *klass = GST_VIDEO_AGGREGATOR_GET_CLASS (vagg);
+  GstAllocator *allocator;
+  GstAllocationParams params;
+
+  /* there are these possibilities:
+   * 1) we use our own buffer allocation method
+   * 2) we need to get a bufferpool from downstream and configure it
+   */
+  if (vagg->capture_io_mode == VIDEOAGGREGATOR_CAPTUREIOMODE_OWN) {
+    GST_DEBUG_OBJECT (vagg, "using our own allocation method");
+    gst_videoaggregator_set_allocation (vagg, NULL, NULL, NULL, NULL);
+    return TRUE;
+  }
+
+  /* Check if the news caps are compatible with the
+   * previous pool configuration
+   */
+  if (vagg->priv->pool) {
+    result = gst_videoaggregator_check_src_pool(vagg, caps);
+    GST_WARNING_OBJECT(vagg, "Pool already configured %s...",
+        result ? "ok" : "wrong format");
+    return result;
+  }
+
+  /* We need to get a bufferpool from downstream and configure it.  */
+  query = gst_query_new_allocation (caps, TRUE);
+  if (!gst_pad_peer_query (vagg->aggregator.srcpad, query)) {
+    /* not a problem, just debug a little */
+    GST_DEBUG_OBJECT (vagg, "peer ALLOCATION query failed");
+  }
+
+  g_assert (klass->decide_allocation != NULL);
+  result = klass->decide_allocation (vagg, query);
+
+  GST_DEBUG_OBJECT (vagg, "Decide allocation return: %" GST_PTR_FORMAT ,query);
+
+  if (!result)
+    goto no_decide_allocation;
+
+  /* we got configuration from our peer or the decide_allocation method,
+   * parse them */
+  if (gst_query_get_n_allocation_params (query) > 0) {
+    gst_query_parse_nth_allocation_param (query, 0, &allocator, &params);
+  } else {
+    allocator = NULL;
+    gst_allocation_params_init (&params);
+  }
+
+  if (gst_query_get_n_allocation_pools (query) > 0)
+    gst_query_parse_nth_allocation_pool (query, 0, &pool, NULL, NULL, NULL);
+
+  GST_DEBUG_OBJECT (vagg, "Final pool %" GST_PTR_FORMAT, pool);
+
+  /* Setting pool, allocation and params */
+  result =
+      gst_videoaggregator_set_allocation (vagg, pool, allocator, &params,
+      query);
+
+  return result;
+
+  /* Errors */
+no_decide_allocation:
+  {
+    GST_WARNING_OBJECT (vagg, "Subclass failed to decide allocation");
+    gst_query_unref (query);
+
+    return result;
+  }
+}
+
 /* WITH GST_VIDEO_AGGREGATOR_LOCK TAKEN */
 static gboolean
 gst_videoaggregator_src_setcaps (GstVideoAggregator * vagg, GstCaps * caps)
@@ -610,6 +928,10 @@ gst_videoaggregator_src_setcaps (GstVideoAggregator * vagg, GstCaps * caps)
 
     GST_VIDEO_AGGREGATOR_LOCK (vagg);
   }
+
+  if (ret)
+    /* If caps has been well configured, we can reconfigure the src bufferpool */
+    ret = gst_videoaggregator_do_bufferpool (vagg, caps);
 
 done:
   return ret;
@@ -925,6 +1247,10 @@ gst_videoaggregator_reset (GstVideoAggregator * vagg)
   gst_video_info_init (&vagg->info);
   vagg->priv->ts_offset = 0;
   vagg->priv->nframes = 0;
+  vagg->priv->pool = NULL;
+  vagg->priv->pool_active = FALSE;
+  vagg->priv->allocator = NULL;
+  vagg->priv->query = NULL;
 
   agg->segment.position = -1;
 
@@ -1410,6 +1736,7 @@ gst_videoaggregator_aggregate (GstAggregator * agg, gboolean timeout)
 
     ret = gst_aggregator_finish_buffer (agg, outbuf);
   }
+
   goto done_unlocked;
 
 done:
@@ -1798,21 +2125,57 @@ gst_videoaggregator_release_pad (GstElement * element, GstPad * pad)
 }
 
 static GstFlowReturn
-gst_videoaggregator_get_output_buffer (GstVideoAggregator * videoaggregator,
-    GstBuffer ** outbuf)
+gst_videoaggregator_get_output_buffer (GstVideoAggregator * vagg,
+     GstBuffer ** outbuf)
 {
-  guint outsize;
+  GstVideoAggregatorPrivate *priv;
+  GstFlowReturn ret;
+  gsize outsize;
   static GstAllocationParams params = { 0, 15, 0, 0, };
 
-  outsize = GST_VIDEO_INFO_SIZE (&videoaggregator->info);
-  *outbuf = gst_buffer_new_allocate (NULL, outsize, &params);
+  priv = vagg->priv;
+  outsize = GST_VIDEO_INFO_SIZE (&vagg->info);
+
+  /* Check if we have a pool buffer */
+  if (priv->pool) {
+    if (!priv->pool_active) {
+      GST_DEBUG_OBJECT (vagg, "setting pool %p active", priv->pool);
+      if (!gst_buffer_pool_set_active (priv->pool, TRUE))
+        goto activate_failed;
+      priv->pool_active = TRUE;
+    }
+    GST_DEBUG_OBJECT (vagg, "using pool alloc");
+    ret = gst_buffer_pool_acquire_buffer (priv->pool, outbuf, NULL);
+    if (ret != GST_FLOW_OK)
+      goto alloc_failed;
+
+    GST_DEBUG_OBJECT (vagg, "Acquiring pool buffer");
+
+  } else {
+    *outbuf = gst_buffer_new_allocate (NULL, outsize, &params);
+    GST_DEBUG_OBJECT (vagg, "Allocating new buffer of %d and params %" GST_PTR_FORMAT,
+        outsize,
+        &params);
+  }
 
   if (*outbuf == NULL) {
-    GST_ERROR_OBJECT (videoaggregator,
+    GST_ERROR_OBJECT (vagg,
         "Could not instantiate buffer of size: %d", outsize);
   }
 
   return GST_FLOW_OK;
+
+activate_failed:
+  {
+    GST_ELEMENT_ERROR (vagg, RESOURCE, SETTINGS,
+      ("failed to activate bufferpool"), ("failed to activate bufferpool"));
+    return GST_FLOW_ERROR;
+  }
+alloc_failed:
+  {
+    GST_DEBUG_OBJECT (vagg, "could not allocate buffer from pool");
+    return ret;
+  }
 }
 
 static gboolean
@@ -1933,7 +2296,12 @@ static void
 gst_videoaggregator_get_property (GObject * object,
     guint prop_id, GValue * value, GParamSpec * pspec)
 {
+  GstVideoAggregator *self = GST_VIDEO_AGGREGATOR (object);
+
   switch (prop_id) {
+    case PROP_CAPTURE_IO_MODE:
+      g_value_set_enum (value, self->capture_io_mode);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1944,7 +2312,12 @@ static void
 gst_videoaggregator_set_property (GObject * object,
     guint prop_id, const GValue * value, GParamSpec * pspec)
 {
+  GstVideoAggregator *self = GST_VIDEO_AGGREGATOR (object);
+
   switch (prop_id) {
+    case PROP_CAPTURE_IO_MODE:
+       self->capture_io_mode = g_value_get_enum (value);
+       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1975,6 +2348,11 @@ gst_videoaggregator_class_init (GstVideoAggregatorClass * klass)
   gstelement_class->release_pad =
       GST_DEBUG_FUNCPTR (gst_videoaggregator_release_pad);
 
+  g_object_class_install_property (gobject_class, PROP_CAPTURE_IO_MODE,
+        g_param_spec_enum ("capture-io-mode", "CaptureIoMode", "Capture IO Mode",
+            GST_TYPE_VIDEOAGGREGATOR_CAPTUREIOMODE,
+            DEFAULT_OWN, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   agg_class->sinkpads_type = GST_TYPE_VIDEO_AGGREGATOR_PAD;
   agg_class->start = gst_videoaggregator_start;
   agg_class->stop = gst_videoaggregator_stop;
@@ -1989,6 +2367,8 @@ gst_videoaggregator_class_init (GstVideoAggregatorClass * klass)
 
   klass->find_best_format = gst_videoaggreagator_find_best_format;
   klass->get_output_buffer = gst_videoaggregator_get_output_buffer;
+  klass->decide_allocation =
+                 GST_DEBUG_FUNCPTR (gst_videoaggregator_decide_allocation);
 
   /* Register the pad class */
   g_type_class_ref (GST_TYPE_VIDEO_AGGREGATOR_PAD);
