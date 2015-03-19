@@ -51,6 +51,19 @@ typedef struct _GstVideoAggregatorPrivate GstVideoAggregatorPrivate;
 #include "gstvideoaggregatorpad.h"
 
 /**
+ * GstVideoAggregatorCaptureIoMode:
+ * @VIDEOAGGREGATOR_CAPTUREIOMODE_IMPORT:   Import buffers from downstream
+ * @VIDEOAGGREGATOR_CAPTUREIOMODE_OWNS:     Use its own allocation buffer
+ *                                          allocation method
+ */
+typedef enum
+{
+  VIDEOAGGREGATOR_CAPTUREIOMODE_IMPORT,
+  VIDEOAGGREGATOR_CAPTUREIOMODE_OWN,
+}
+GstVideoAggregatorCaptureIoMode;
+
+/**
  * GstVideoAggregator:
  * @info: The #GstVideoInfo representing the currently set
  * srcpad caps.
@@ -62,6 +75,7 @@ struct _GstVideoAggregator
   /*< public >*/
   /* Output caps */
   GstVideoInfo info;
+  GstVideoAggregatorCaptureIoMode capture_io_mode;
 
   /* < private > */
   GstVideoAggregatorPrivate *priv;
@@ -86,6 +100,9 @@ struct _GstVideoAggregator
  *                            Notifies subclasses what caps format has been negotiated
  * @find_best_format:         Optional.
  *                            Lets subclasses decide of the best common format to use.
+ * @decide_allocation:        Setup the allocation parameters for allocating output
+ *                            buffers. The passed in query contains the result of the
+ *                            downstream allocation query.
  **/
 struct _GstVideoAggregatorClass
 {
@@ -105,6 +122,8 @@ struct _GstVideoAggregatorClass
                                                    GstCaps            *  downstream_caps,
                                                    GstVideoInfo       *  best_info,
                                                    gboolean           *  at_least_one_alpha);
+  gboolean           (*decide_allocation)         (GstVideoAggregator *  vagg,
+                                                   GstQuery           *  query);
   /* < private > */
   gpointer            _gst_reserved[GST_PADDING_LARGE];
 };
