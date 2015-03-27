@@ -792,6 +792,49 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
   return ret;
 }
 
+/**
+ * Return false if at least one videoaggregator's sinkpad->aggregated_frame
+ * has the same or bigger resolution than outframe.
+ */
+static gboolean
+gst_compositor_check_background_required (GstVideoAggregator * vagg,
+    GstVideoFrame * outframe)
+{
+  gboolean required = TRUE;
+  GList *l;
+  guint bg_xlu, bg_ylu, bg_xrb, bg_yrb; /* bg_x Left-up right-bottom */
+  guint sink_xlu, sink_ylu, sink_xrb, sink_yrb; /* sink_x Left-up right-bottom */
+
+  /* Background rectagle */
+  bg_xlu = 0;
+  bg_ylu = 0;
+  bg_xrb = GST_VIDEO_FRAME_WIDTH (outframe);
+  bg_yrb= GST_VIDEO_FRAME_HEIGHT (outframe);
+
+  GST_OBJECT_LOCK (vagg);
+  for (l = GST_ELEMENT (vagg)->sinkpads; l && required; l = l->next) {
+    GstVideoAggregatorPad *pad = l->data;
+    GstCompositorPad *compo_pad = GST_COMPOSITOR_PAD (pad);
+
+    if (!pad->aggregated_frame)
+      continue;
+
+    sink_xlu = compo_pad->xpos;
+    sink_ylu = compo_pad->ypos;
+    sink_xrb = sink_xlu + GST_VIDEO_FRAME_WIDTH (pad->aggregated_frame);
+    sink_yrb = sink_ylu + GST_VIDEO_FRAME_HEIGHT (pad->aggregated_frame);
+
+    required = !(compo_pad->alpha == 1.0 &&
+        (sink_xlu <= bg_xlu) && (bg_ylu <= sink_ylu) &&
+        (sink_xrb >= bg_xrb) && (bg_yrb >= sink_yrb));
+  }
+  GST_OBJECT_UNLOCK (vagg);
+  GST_DEBUG_OBJECT (vagg, "Background %s", required ?
+      "required" : "not required");
+
+  return required;
+}
+
 static GstFlowReturn
 gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 {
@@ -808,51 +851,52 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
   outframe = &out_frame;
   /* default to blending */
   composite = self->blend;
-  switch (self->background) {
-    case COMPOSITOR_BACKGROUND_CHECKER:
-      self->fill_checker (outframe);
-      break;
-    case COMPOSITOR_BACKGROUND_BLACK:
-      self->fill_color (outframe, 16, 128, 128);
-      break;
-    case COMPOSITOR_BACKGROUND_WHITE:
-      self->fill_color (outframe, 240, 128, 128);
-      break;
-    case COMPOSITOR_BACKGROUND_TRANSPARENT:
-    {
-      guint i, plane, num_planes, height;
+  /* Check if we need background */
+  if (gst_compositor_check_background_required (vagg, outframe))
+    switch (self->background) {
+      case COMPOSITOR_BACKGROUND_CHECKER:
+        self->fill_checker (outframe);
+        break;
+      case COMPOSITOR_BACKGROUND_BLACK:
+        self->fill_color (outframe, 16, 128, 128);
+        break;
+      case COMPOSITOR_BACKGROUND_WHITE:
+        self->fill_color (outframe, 240, 128, 128);
+        break;
+      case COMPOSITOR_BACKGROUND_TRANSPARENT:
+      {
+        guint i, plane, num_planes, height;
 
-      num_planes = GST_VIDEO_FRAME_N_PLANES (outframe);
-      for (plane = 0; plane < num_planes; ++plane) {
-        guint8 *pdata;
-        gsize rowsize, plane_stride;
+        num_planes = GST_VIDEO_FRAME_N_PLANES (outframe);
+        for (plane = 0; plane < num_planes; ++plane) {
+          guint8 *pdata;
+          gsize rowsize, plane_stride;
 
-        pdata = GST_VIDEO_FRAME_PLANE_DATA (outframe, plane);
-        plane_stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, plane);
-        rowsize = GST_VIDEO_FRAME_COMP_WIDTH (outframe, plane)
-            * GST_VIDEO_FRAME_COMP_PSTRIDE (outframe, plane);
-        height = GST_VIDEO_FRAME_COMP_HEIGHT (outframe, plane);
-        for (i = 0; i < height; ++i) {
-          memset (pdata, 0, rowsize);
-          pdata += plane_stride;
+          pdata = GST_VIDEO_FRAME_PLANE_DATA (outframe, plane);
+          plane_stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, plane);
+          rowsize = GST_VIDEO_FRAME_COMP_WIDTH (outframe, plane)
+              * GST_VIDEO_FRAME_COMP_PSTRIDE (outframe, plane);
+          height = GST_VIDEO_FRAME_COMP_HEIGHT (outframe, plane);
+          for (i = 0; i < height; ++i) {
+            memset (pdata, 0, rowsize);
+            pdata += plane_stride;
+          }
         }
-      }
 
-      /* use overlay to keep background transparent */
-      composite = self->overlay;
-      break;
+        /* use overlay to keep background transparent */
+        composite = self->overlay;
+        break;
+      }
     }
-  }
 
   GST_OBJECT_LOCK (vagg);
   for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
     GstVideoAggregatorPad *pad = l->data;
     GstCompositorPad *compo_pad = GST_COMPOSITOR_PAD (pad);
 
-    if (pad->aggregated_frame != NULL) {
+    if (pad->aggregated_frame != NULL)
       composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
           compo_pad->alpha, outframe);
-    }
   }
   GST_OBJECT_UNLOCK (vagg);
 
